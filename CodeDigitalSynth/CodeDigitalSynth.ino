@@ -1,6 +1,8 @@
 #include <I2S.h>
 #include <SPI.h>
 #include "MCP_ADC.h"
+#include <Adafruit_TinyUSB.h>
+#include <MIDI.h>
 
 #define LRCK_PIN  28   
 #define BCK_PIN   27   
@@ -9,7 +11,6 @@
 
 
 #define SAMPLE_RATE 44100
-#define FREQUENCY   440.0f   // A4 note
 #define AMPLITUDE   32767 // maximum, later i will apply volume multiplication
 
 
@@ -18,9 +19,66 @@
 #define MCP_DIN   18   
 #define MCP_CLK   19
 
+// Buttons
+#define BUTTON1 20 // Waweform changing button
+#define BUTTON2 21 // Sound ON/OF
+#define BUTTON3 22
+#define BUTTON4 13
+
+
+Adafruit_USBD_MIDI usb_midi;
+MIDI_CREATE_INSTANCE(Adafruit_USBD_MIDI, usb_midi, MIDI);
+
+
+// Main mode variables
+float volume = 1.0f;
+float detune = 0.0f;
+float portamento = 0.0f;
+
+
+float baseFrequency = 440.0f;  
+int midiNote = 69; 
+
+
+// Portamento values
+float currentFrequency = 440.0f; // A4 note
+float targetFrequency  = 440.0f; 
+
+// FX mode variables
+float cutoff = 0.0f;
+float resonance = 0.0f;
+float delayTime = 0.0f;
+float delayMix = 0.0f;
+
+// LFO mode variables
+
+float lfoRate = 1.0f;
+float lfoDepth = 0.0f;
+float lfoTarget = 0;
+float lfoAttack = 0.5f;
+
+
+/*
+Modes
+MAIN mode: Volume, Detune, Frequency, Portamento
+
+ADSR mode: AttackRate, DecayRate, Sustain Level, ReleaseRate
+
+FX mode: Cutoff, Resonance, DelayTime, DelayMix
+
+LFO mode: LFORate, LFODepth,  LFOTarget, LFO Attack
+
+
+*/
+
+
+enum Mode { MAIN, ADSR, FX, LFO };
+Mode currentMode = MAIN;
+
 
 int waveform = 0; // 0 for sine, 1 for square, 2 for saw, 3 for triangle
 I2S i2s(OUTPUT);
+
 MCP3208 mcp(&SPI); 
 
 
@@ -29,17 +87,21 @@ ADSRState envState = OFF;
 
 
 float attackRate = 0.015f; // max 0.0000075f 
-float decayRate = 0.003fl; // max 0.0000113f
+float decayRate = 0.003f; // max 0.0000113f
 float sustainLevel = 0.6f; // 0 to 1
 float releaseRate = 0.003f; // max 0.0000045f
 
 float envLevel = 0.0f;  // current envelope volume (0.0 – 1.0)
 
-// Call this to start a note (e.g. button press)
+
 void noteOn()  { envState = ATTACK; }
 
-// Call this to release a note (e.g. button release)
+
 void noteOff() { envState = RELEASE; }
+
+
+
+
 
 // uses log to make the potenciometer feel nonlinear.
 float analogReadLog(uint8_t ch, float minT, float maxT) {
@@ -48,16 +110,105 @@ float analogReadLog(uint8_t ch, float minT, float maxT) {
 }
 
 
-void updateADSR() {
-  attackRate = 1.0f / (analogReadLog(0, 0.001f, 3.0f) * SAMPLE_RATE);
-  decayRate = 1.0f / (analogReadLog(1, 0.005f, 2.0f) * SAMPLE_RATE);
-  sustainLevel = mcp.read(2) / 4095.0f;
-  releaseRate = 1.0f / (analogReadLog(3, 0.005f, 5.0f) * SAMPLE_RATE);
+void updateButtons() {
+  static bool last1 = HIGH, last2 = HIGH, last3 = HIGH, last4 = HIGH;
+  static unsigned long lastTime1 = 0, lastTime2 = 0, lastTime3 = 0, lastTime4 = 0;
+
+  bool b1 = digitalRead(BUTTON1);
+  bool b2 = digitalRead(BUTTON2);
+  bool b3 = digitalRead(BUTTON3);
+  bool b4 = digitalRead(BUTTON4);
+
+  // wavedform button
+  if (last1 == HIGH && b1 == LOW && millis() - lastTime1 > 50) {
+    waveform = (waveform + 1) % 4;
+    lastTime1 = millis();
+  }
+
+  // on/off button
+  if (last2 == HIGH && b2 == LOW) noteOn();
+  if (last2 == LOW  && b2 == HIGH) noteOff();
+
+  // cycle mode button
+  if (last3 == HIGH && b3 == LOW && millis() - lastTime3 > 50) {
+    currentMode = (Mode)((currentMode + 1) % 4);
+    lastTime3 = millis();
+  }
+
+  // free for now
+  if (last4 == HIGH && b4 == LOW && millis() - lastTime4 > 50) {
+    lastTime4 = millis();
+  }
+
+  last1 = b1; last2 = b2; last3 = b3; last4 = b4;
 }
 
 
+void updateKnobs() {
+  switch (currentMode) {
+    case MAIN:
+      
+      volume = mcp.read(0) / 4095.0f;
+      float detuneAmount = (mcp.read(1) / 2047.5f) - 1.0f;
+      baseFrequency = analogReadLog(2, 20.0f, 2000.0f);
+      targetFrequency = baseFrequency * powf(2.0f, (midiNote - 69.0f) / 12.0f);
+      detune = targetFrequency * (powf(2.0f, detuneAmount * 50.0f / 1200.0f) - 1.0f);
+      portamento = mcp.read(3) / 4095.0f;
+      break;
+
+    case ADSR:
+
+      attackRate = 1.0f / (analogReadLog(0, 0.001f, 3.0f) * SAMPLE_RATE);
+      decayRate = 1.0f / (analogReadLog(1, 0.005f, 2.0f) * SAMPLE_RATE);
+      sustainLevel = mcp.read(2) / 4095.0f;
+      releaseRate = 1.0f / (analogReadLog(3, 0.005f, 5.0f) * SAMPLE_RATE);
+      break;
+
+    case FX:
+
+      cutoff = analogReadLog(0, 200.0f, 8000.0f);
+      resonance = mcp.read(1) / 4095.0f;
+      delayTime = mcp.read(2) / 4095.0f;
+      delayMix = mcp.read(3) / 4095.0f;
+      break;
+
+    case LFO:
+      
+      lfoRate = analogReadLog(0, 0.1f, 20.0f);
+      lfoDepth = mcp.read(1) / 4095.0f;
+      lfoTarget = map(mcp.read(2), 0, 4095, 0, 2);
+      lfoAttack = analogReadLog(3, 0.05f, 5.0f);
+      break;
+  
+  }
+}
+
+
+void readMidi() {
+  if (MIDI.read()) {
+    if (MIDI.getType() == midi::NoteOn && MIDI.getData2() > 0) {
+      midiNote = MIDI.getData1();  
+      targetFrequency = baseFrequency * powf(2.0f, (midiNote - 69.0f) / 12.0f);
+      noteOn();
+    }
+    if (MIDI.getType() == midi::NoteOff || 
+      (MIDI.getType() == midi::NoteOn && MIDI.getData2() == 0)) {
+      noteOff();
+    }
+  }
+
+}
+ 
+
 void setup() {
   
+  USBDevice.begin();
+
+  pinMode(BUTTON1, INPUT_PULLUP);
+  pinMode(BUTTON2, INPUT_PULLUP);
+  pinMode(BUTTON3, INPUT_PULLUP);
+  pinMode(BUTTON4, INPUT_PULLUP);
+
   SPI.setRX(MCP_DOUT);
   SPI.setTX(MCP_DIN);
   SPI.setSCK(MCP_CLK);
@@ -69,14 +220,33 @@ void setup() {
   i2s.setLRCLK(LRCK_PIN);
   i2s.setBitsPerSample(16);
   i2s.begin(SAMPLE_RATE);
+
+  usb_midi.begin();
+  MIDI.begin(MIDI_CHANNEL_OMNI);
 }
 
 void loop() {
   static float phase = 0.0f;
-  const float inc = 2.0f * M_PI * FREQUENCY / SAMPLE_RATE;
+  
+  float portaCoeff = 1.0f - portamento * 0.9997f;
+  currentFrequency += (targetFrequency - currentFrequency) * portaCoeff;
+  
+  
+  const float inc = 2.0f * M_PI * (currentFrequency + detune) / SAMPLE_RATE;
 
   int16_t sample = 0;
   
+  static unsigned long lastControlUpdate = 0;
+  
+  readMidi();
+  
+  if (millis() - lastControlUpdate > 5) { // every 5ms
+    updateButtons();
+    updateKnobs();
+    lastControlUpdate = millis();
+  }
+
+
   switch (envState) {
     case ATTACK:
       envLevel += attackRate;
@@ -116,7 +286,11 @@ void loop() {
       break;
   } 
   
-  sample = (int16_t)(sample * envLevel);
+  int32_t s = (int32_t)sample * envLevel * volume;
+  if (s >  32767) s =  32767;
+  if (s < -32768) s = -32768;
+  sample = (int16_t)s;
+
 
   i2s.write16(sample, sample);  // Left, Right
 
