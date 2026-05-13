@@ -45,10 +45,16 @@ float currentFrequency = 440.0f; // A4 note
 float targetFrequency  = 440.0f; 
 
 // FX mode variables
+float filterState = 0.0f;
 float cutoff = 0.0f;
 float resonance = 0.0f;
 float delayTime = 0.0f;
 float delayMix = 0.0f;
+
+#define DELAY_MAX_SAMPLES (SAMPLE_RATE )  // 1 second
+int16_t delayBuffer[DELAY_MAX_SAMPLES] = {0};
+int delayWritePos = 0;
+
 
 // LFO mode variables
 
@@ -291,8 +297,31 @@ void loop() {
   if (s < -32768) s = -32768;
   sample = (int16_t)s;
 
+  
+  float alpha = (2.0f * M_PI * cutoff) /
+              (2.0f * M_PI * cutoff + SAMPLE_RATE);
 
-  i2s.write16(sample, sample);  // Left, Right
+  // low-pass filter
+  filterState += alpha * ((float)sample - filterState);
+
+  sample = (int16_t)filterState;
+
+
+  // Compute delay read position
+  int delaySamples = (int)(delayTime * (DELAY_MAX_SAMPLES - 1));
+  int delayReadPos = delayWritePos - delaySamples;
+  if (delayReadPos < 0) delayReadPos += DELAY_MAX_SAMPLES;
+
+  // Read from buffer, write dry signal in
+  int16_t delaySig = delayBuffer[delayReadPos];
+  delayBuffer[delayWritePos] = sample + (int16_t)(delaySig * 0.5f); // 0.5f = feedback amount
+  delayWritePos = (delayWritePos + 1) % DELAY_MAX_SAMPLES;
+
+  
+  int32_t mixed = (int32_t)(sample * (1.0f - delayMix)) + (int32_t)(delaySig * delayMix);
+  mixed = constrain(mixed, -32768, 32767);
+
+  i2s.write16((int16_t)mixed, (int16_t)mixed);
 
   phase += inc;
   if (phase >= 2.0f * M_PI) phase -= 2.0f * M_PI;
