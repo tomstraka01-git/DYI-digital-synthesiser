@@ -45,7 +45,6 @@ float currentFrequency = 440.0f; // A4 note
 float targetFrequency  = 440.0f; 
 
 // FX mode variables
-float filterState = 0.0f;
 float cutoff = 0.0f;
 float resonance = 0.0f;
 float delayTime = 0.0f;
@@ -58,6 +57,7 @@ int delayWritePos = 0;
 
 // LFO mode variables
 
+float lfoEnvelope = 0.0f;
 float lfoRate = 1.0f;
 float lfoDepth = 0.0f;
 float lfoTarget = 0;
@@ -100,7 +100,8 @@ float releaseRate = 0.003f; // max 0.0000045f
 float envLevel = 0.0f;  // current envelope volume (0.0 – 1.0)
 
 
-void noteOn()  { envState = ATTACK; }
+void noteOn()  { envState = ATTACK; 
+                 lfoEnvelope = 0.0f;}
 
 
 void noteOff() { envState = RELEASE; }
@@ -204,7 +205,38 @@ void readMidi() {
   }
 
 }
- 
+
+int16_t applyFilter(int16_t input, float fc) {
+    static float svf_low = 0.0f;
+    static float svf_band = 0.0f;
+
+    float f = 2.0f * sinf(M_PI * fc / SAMPLE_RATE);  // fc instead of cutoff
+    if (f > 0.95f) f = 0.95f;
+
+    float q = 2.0f - (resonance * 1.9f);
+    float in = (float)input;
+
+    svf_low  = svf_low + f * svf_band;
+    float svf_high = in - svf_low - q * svf_band;
+    svf_band = f * svf_high + svf_band;
+
+    return (int16_t)constrain((int32_t)svf_low, -32768, 32767);
+}
+
+float applyLFO() {
+    static float lfoPhase = 0.0f;
+
+    float attackRate = 1.0f / (lfoAttack * SAMPLE_RATE);
+    lfoEnvelope += attackRate;
+    if (lfoEnvelope > 1.0f) lfoEnvelope = 1.0f;
+
+    float lfoWave = sinf(lfoPhase);
+
+    lfoPhase += 2.0f * M_PI * lfoRate / SAMPLE_RATE;
+    if (lfoPhase >= 2.0f * M_PI) lfoPhase -= 2.0f * M_PI;
+
+    return lfoWave * lfoDepth * lfoEnvelope;
+}
 
 void setup() {
   
@@ -238,8 +270,7 @@ void loop() {
   currentFrequency += (targetFrequency - currentFrequency) * portaCoeff;
   
   
-  const float inc = 2.0f * M_PI * (currentFrequency + detune) / SAMPLE_RATE;
-
+ 
   int16_t sample = 0;
   
   static unsigned long lastControlUpdate = 0;
@@ -297,14 +328,29 @@ void loop() {
   if (s < -32768) s = -32768;
   sample = (int16_t)s;
 
-  
-  float alpha = (2.0f * M_PI * cutoff) /
-              (2.0f * M_PI * cutoff + SAMPLE_RATE);
+  float lfoValue = applyLFO();
+  float frequencyMod = currentFrequency;
+  float cutoffMod = cutoff;  // local copy — never touch the global
 
-  // low-pass filter
-  filterState += alpha * ((float)sample - filterState);
+  switch ((int)lfoTarget) {
+      case 0: // pitch — modulate local copy
+          frequencyMod += currentFrequency * lfoValue * 0.05f;
+          break;
+      case 1: // volume
+          s = (int32_t)(s * (1.0f + lfoValue * 0.5f));
+          s = constrain(s, -32768, 32767);
+          sample = (int16_t)s;  // write back to sample
+          break;
+      case 2: // filter cutoff — modulate local copy
+          cutoffMod *= (1.0f + lfoValue);
+         cutoffMod = constrain(cutoffMod, 20.0f, 20000.0f);
+         break;
+}
+  const float inc = 2.0f * M_PI * (frequencyMod + detune) / SAMPLE_RATE;
 
-  sample = (int16_t)filterState;
+  // pass cutoffMod into filter
+  sample = applyFilter(sample, cutoffMod);
+
 
 
   // Compute delay read position
