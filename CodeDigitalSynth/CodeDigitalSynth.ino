@@ -3,176 +3,141 @@
 #include "MCP_ADC.h"
 #include <Adafruit_TinyUSB.h>
 #include <MIDI.h>
+#include "pico/multicore.h"
 
 #define LRCK_PIN  28   
 #define BCK_PIN   27   
 #define DIN_PIN   26   
 
-
-
 #define SAMPLE_RATE 44100
-#define AMPLITUDE   32767 // maximum, later i will apply volume multiplication
-
+#define AMPLITUDE   32767
 
 #define MCP_DOUT  16   
 #define MCP_CS    17   
 #define MCP_DIN   18   
 #define MCP_CLK   19
 
-// Buttons
-#define BUTTON1 20 // Waweform changing button
-#define BUTTON2 21 // Sound ON/OF
-#define BUTTON3 22
-#define BUTTON4 13
-
+#define BUTTON1 20 // OSC1 waveform cycle
+#define BUTTON2 21 // Sound ON/OFF
+#define BUTTON3 22 // Mode cycle
+#define BUTTON4 13 // OSC2 waveform cycle  ← now used
 
 Adafruit_USBD_MIDI usb_midi;
 MIDI_CREATE_INSTANCE(Adafruit_USBD_MIDI, usb_midi, MIDI);
-
 
 // Main mode variables
 float volume = 1.0f;
 float detune = 0.0f;
 float portamento = 0.0f;
-
+float osc2Level = 0.5f;  // 0 = OSC1 only, 1 = OSC2 only, 0.5 = equal
+float osc2SemiOffset = 0.0f;  // -24 to +24 semitones
 
 float baseFrequency = 440.0f;  
-int midiNote = 69; 
+int   midiNote = 69; 
 
-
-// Portamento values
-float currentFrequency = 440.0f; // A4 note
-float targetFrequency  = 440.0f; 
+float currentFrequency = 440.0f;
+float targetFrequency = 440.0f; 
 
 // FX mode variables
-float cutoff = 0.0f;
+float cutoff = 1000.0f;
 float resonance = 0.0f;
 float delayTime = 0.0f;
-float delayMix = 0.0f;
+float delayMix  = 0.0f;
 
-#define DELAY_MAX_SAMPLES (SAMPLE_RATE )  // 1 second
+#define DELAY_MAX_SAMPLES (SAMPLE_RATE)
 int16_t delayBuffer[DELAY_MAX_SAMPLES] = {0};
 int delayWritePos = 0;
 
-
 // LFO mode variables
-
 float lfoEnvelope = 0.0f;
 float lfoRate = 1.0f;
 float lfoDepth = 0.0f;
 float lfoTarget = 0;
 float lfoAttack = 0.5f;
 
-
-/*
-Modes
-MAIN mode: Volume, Detune, Frequency, Portamento
-
-ADSR mode: AttackRate, DecayRate, Sustain Level, ReleaseRate
-
-FX mode: Cutoff, Resonance, DelayTime, DelayMix
-
-LFO mode: LFORate, LFODepth,  LFOTarget, LFO Attack
-
-
-*/
-
-
 enum Mode { MAIN, ADSR, FX, LFO };
 Mode currentMode = MAIN;
 
+int waveform1 = 0;
+int waveform2 = 1; // default OSC2 to square for a different texture
 
-int waveform = 0; // 0 for sine, 1 for square, 2 for saw, 3 for triangle
 I2S i2s(OUTPUT);
-
 MCP3208 mcp(&SPI); 
-
 
 enum ADSRState { ATTACK, DECAY, SUSTAIN, RELEASE, OFF };
 ADSRState envState = OFF;
 
+float attackRate = 0.015f;
+float decayRate = 0.003f;
+float sustainLevel = 0.6f;
+float releaseRate = 0.003f;
+float envLevel = 0.0f;
 
-float attackRate = 0.015f; // max 0.0000075f 
-float decayRate = 0.003f; // max 0.0000113f
-float sustainLevel = 0.6f; // 0 to 1
-float releaseRate = 0.003f; // max 0.0000045f
-
-float envLevel = 0.0f;  // current envelope volume (0.0 – 1.0)
-
-
-void noteOn()  { envState = ATTACK; 
-                 lfoEnvelope = 0.0f;}
-
-
+void noteOn()  { envState = ATTACK; lfoEnvelope = 0.0f; }
 void noteOff() { envState = RELEASE; }
 
-
-
-
-
-// uses log to make the potenciometer feel nonlinear.
 float analogReadLog(uint8_t ch, float minT, float maxT) {
   float pot = mcp.read(ch) / 4095.0f;
   return minT * powf(maxT / minT, pot);
 }
 
-
 void updateButtons() {
   static bool last1 = HIGH, last2 = HIGH, last3 = HIGH, last4 = HIGH;
-  static unsigned long lastTime1 = 0, lastTime2 = 0, lastTime3 = 0, lastTime4 = 0;
+  static unsigned long lastTime1 = 0, lastTime3 = 0, lastTime4 = 0;
 
   bool b1 = digitalRead(BUTTON1);
   bool b2 = digitalRead(BUTTON2);
   bool b3 = digitalRead(BUTTON3);
   bool b4 = digitalRead(BUTTON4);
 
-  // wavedform button
+  // OSC1 waveform cycle
   if (last1 == HIGH && b1 == LOW && millis() - lastTime1 > 50) {
-    waveform = (waveform + 1) % 4;
+    waveform1 = (waveform1 + 1) % 4;
     lastTime1 = millis();
   }
 
-  // on/off button
-  if (last2 == HIGH && b2 == LOW) noteOn();
+  // note on/off
+  if (last2 == HIGH && b2 == LOW)  noteOn();
   if (last2 == LOW  && b2 == HIGH) noteOff();
 
-  // cycle mode button
+  // mode cycle
   if (last3 == HIGH && b3 == LOW && millis() - lastTime3 > 50) {
     currentMode = (Mode)((currentMode + 1) % 4);
     lastTime3 = millis();
   }
 
-  // free for now
+  // OSC2 waveform cycle  
   if (last4 == HIGH && b4 == LOW && millis() - lastTime4 > 50) {
+    waveform2 = (waveform2 + 1) % 4;
     lastTime4 = millis();
   }
 
   last1 = b1; last2 = b2; last3 = b3; last4 = b4;
 }
 
-
 void updateKnobs() {
   switch (currentMode) {
     case MAIN:
-      
       volume = mcp.read(0) / 4095.0f;
+      {
       float detuneAmount = (mcp.read(1) / 2047.5f) - 1.0f;
       baseFrequency = analogReadLog(2, 20.0f, 2000.0f);
       targetFrequency = baseFrequency * powf(2.0f, (midiNote - 69.0f) / 12.0f);
       detune = targetFrequency * (powf(2.0f, detuneAmount * 50.0f / 1200.0f) - 1.0f);
-      portamento = mcp.read(3) / 4095.0f;
-      break;
+      }
+    portamento = mcp.read(3) / 4095.0f; 
+    if (mcp.read(3) < 10) portamento = 0.0f;
+    osc2SemiOffset = (mcp.read(4) / 4095.0f) * 48.0f - 24.0f;  // -24 to +24 semitones
+    break;
 
     case ADSR:
-
-      attackRate = 1.0f / (analogReadLog(0, 0.001f, 3.0f) * SAMPLE_RATE);
-      decayRate = 1.0f / (analogReadLog(1, 0.005f, 2.0f) * SAMPLE_RATE);
+      attackRate = 1.0f / (analogReadLog(0, 0.001f, 3.0f)  * SAMPLE_RATE);
+      decayRate = 1.0f / (analogReadLog(1, 0.005f, 2.0f)  * SAMPLE_RATE);
       sustainLevel = mcp.read(2) / 4095.0f;
-      releaseRate = 1.0f / (analogReadLog(3, 0.005f, 5.0f) * SAMPLE_RATE);
+      releaseRate = 1.0f / (analogReadLog(3, 0.005f, 5.0f)  * SAMPLE_RATE);
       break;
 
     case FX:
-
       cutoff = analogReadLog(0, 200.0f, 8000.0f);
       resonance = mcp.read(1) / 4095.0f;
       delayTime = mcp.read(2) / 4095.0f;
@@ -180,66 +145,84 @@ void updateKnobs() {
       break;
 
     case LFO:
-      
+
       lfoRate = analogReadLog(0, 0.1f, 20.0f);
       lfoDepth = mcp.read(1) / 4095.0f;
-      lfoTarget = map(mcp.read(2), 0, 4095, 0, 2);
-      lfoAttack = analogReadLog(3, 0.05f, 5.0f);
+      lfoTarget = (float)(mcp.read(2) * 2 / 4095);
+      lfoAttack = analogReadLog(3, 0.05f, 5.0f);   
+      osc2Level = mcp.read(4) / 4095.0f;          
       break;
-  
   }
 }
-
 
 void readMidi() {
   if (MIDI.read()) {
     if (MIDI.getType() == midi::NoteOn && MIDI.getData2() > 0) {
-      midiNote = MIDI.getData1();  
+      midiNote        = MIDI.getData1();  
       targetFrequency = baseFrequency * powf(2.0f, (midiNote - 69.0f) / 12.0f);
       noteOn();
     }
     if (MIDI.getType() == midi::NoteOff || 
-      (MIDI.getType() == midi::NoteOn && MIDI.getData2() == 0)) {
+       (MIDI.getType() == midi::NoteOn && MIDI.getData2() == 0)) {
       noteOff();
     }
   }
-
 }
 
 int16_t applyFilter(int16_t input, float fc) {
-    static float svf_low = 0.0f;
-    static float svf_band = 0.0f;
+  static float svf_low = 0.0f;
+  static float svf_band = 0.0f;
 
-    float f = 2.0f * sinf(M_PI * fc / SAMPLE_RATE);  // fc instead of cutoff
-    if (f > 0.95f) f = 0.95f;
+  float f = 2.0f * sinf(M_PI * fc / SAMPLE_RATE);
+  if (f > 0.95f) f = 0.95f;
 
-    float q = 2.0f - (resonance * 1.9f);
-    float in = (float)input;
+  float q  = 2.0f - (resonance * 1.9f);
+  float in = (float)input;
 
-    svf_low  = svf_low + f * svf_band;
-    float svf_high = in - svf_low - q * svf_band;
-    svf_band = f * svf_high + svf_band;
+  svf_low  = svf_low + f * svf_band;
+  float svf_high = in - svf_low - q * svf_band;
+  svf_band = f * svf_high + svf_band;
 
-    return (int16_t)constrain((int32_t)svf_low, -32768, 32767);
+  return (int16_t)constrain((int32_t)svf_low, -32768, 32767);
 }
 
 float applyLFO() {
-    static float lfoPhase = 0.0f;
+  static float lfoPhase = 0.0f;
 
-    float attackRate = 1.0f / (lfoAttack * SAMPLE_RATE);
-    lfoEnvelope += attackRate;
-    if (lfoEnvelope > 1.0f) lfoEnvelope = 1.0f;
+  float ar = 1.0f / (lfoAttack * SAMPLE_RATE);
+  lfoEnvelope += ar;
+  if (lfoEnvelope > 1.0f) lfoEnvelope = 1.0f;
 
-    float lfoWave = sinf(lfoPhase);
+  float lfoWave = sinf(lfoPhase);
 
-    lfoPhase += 2.0f * M_PI * lfoRate / SAMPLE_RATE;
-    if (lfoPhase >= 2.0f * M_PI) lfoPhase -= 2.0f * M_PI;
+  lfoPhase += 2.0f * M_PI * lfoRate / SAMPLE_RATE;
+  if (lfoPhase >= 2.0f * M_PI) lfoPhase -= 2.0f * M_PI;
 
-    return lfoWave * lfoDepth * lfoEnvelope;
+  return lfoWave * lfoDepth * lfoEnvelope;
+}
+
+
+inline int16_t generateSample(int wf, float ph) {
+  switch (wf) {
+    case 0: return (int16_t)(sinf(ph) * AMPLITUDE);
+    case 1: return (int16_t)((ph < M_PI ? 1.0f : -1.0f) * AMPLITUDE);
+    case 2: return (int16_t)((1.0f - ph / M_PI) * AMPLITUDE);
+    case 3: return (int16_t)((ph < M_PI
+              ? (ph / M_PI * 2.0f - 1.0f)
+              : (3.0f - ph / M_PI * 2.0f)) * AMPLITUDE);
+    default: return 0;
+  }
+}
+
+void controlLoop() {
+  while (true) {
+    updateButtons();
+    updateKnobs();
+    delay(10);
+  }
 }
 
 void setup() {
-  
   USBDevice.begin();
 
   pinMode(BUTTON1, INPUT_PULLUP);
@@ -261,29 +244,25 @@ void setup() {
 
   usb_midi.begin();
   MIDI.begin(MIDI_CHANNEL_OMNI);
+
+  multicore_launch_core1(controlLoop);
 }
 
+
+
 void loop() {
-  static float phase = 0.0f;
-  
+  static float phase1 = 0.0f;
+  static float phase2 = 0.0f;
+
+  // Portamento
   float portaCoeff = 1.0f - portamento * 0.9997f;
   currentFrequency += (targetFrequency - currentFrequency) * portaCoeff;
-  
-  
- 
-  int16_t sample = 0;
-  
-  static unsigned long lastControlUpdate = 0;
-  
+
   readMidi();
-  
-  if (millis() - lastControlUpdate > 5) { // every 5ms
-    updateButtons();
-    updateKnobs();
-    lastControlUpdate = millis();
-  }
 
 
+
+  // ADSR envelope
   switch (envState) {
     case ATTACK:
       envLevel += attackRate;
@@ -293,85 +272,79 @@ void loop() {
       envLevel -= decayRate;
       if (envLevel <= sustainLevel) { envLevel = sustainLevel; envState = SUSTAIN; }
       break;
-    case SUSTAIN:
-      envLevel = sustainLevel; 
-      break;
+    case SUSTAIN: envLevel = sustainLevel; break;
     case RELEASE:
       envLevel -= releaseRate;
       if (envLevel <= 0.0f) { envLevel = 0.0f; envState = OFF; }
       break;
-    case OFF:
-      envLevel = 0.0f;
-      break;
+    case OFF: envLevel = 0.0f; break;
   }
 
-  switch (waveform) {
-    case 0:
-      sample = (int16_t)(sinf(phase) * AMPLITUDE);
-      break;
-    case 1:
-      sample = (int16_t)((phase < M_PI ? 1.0f : -1.0f) * AMPLITUDE);
-      break;
-    case 2:
-      sample = (int16_t)((1.0f - phase / M_PI) * AMPLITUDE);
-      break;
-    case 3:
-      sample = (int16_t)((phase < M_PI ? (phase / M_PI * 2.0f - 1.0f) : (3.0f - phase / M_PI * 2.0f)) * AMPLITUDE);
-      break;
-    default: 
-      sample = 0; 
-      break;
-  } 
-  
-  int32_t s = (int32_t)sample * envLevel * volume;
-  if (s >  32767) s =  32767;
-  if (s < -32768) s = -32768;
-  sample = (int16_t)s;
-
-  float lfoValue = applyLFO();
+  // --- LFO ---
+  float lfoValue    = applyLFO();
   float frequencyMod = currentFrequency;
-  float cutoffMod = cutoff;  // local copy — never touch the global
+  float cutoffMod   = cutoff;
 
   switch ((int)lfoTarget) {
-      case 0: // pitch — modulate local copy
-          frequencyMod += currentFrequency * lfoValue * 0.05f;
-          break;
-      case 1: // volume
-          s = (int32_t)(s * (1.0f + lfoValue * 0.5f));
-          s = constrain(s, -32768, 32767);
-          sample = (int16_t)s;  // write back to sample
-          break;
-      case 2: // filter cutoff — modulate local copy
-          cutoffMod *= (1.0f + lfoValue);
-         cutoffMod = constrain(cutoffMod, 20.0f, 20000.0f);
-         break;
-}
-  const float inc = 2.0f * M_PI * (frequencyMod + detune) / SAMPLE_RATE;
+    case 0: frequencyMod += currentFrequency * lfoValue * 0.05f; break;
+    case 2:
+      cutoffMod *= (1.0f + lfoValue);
+      cutoffMod  = constrain(cutoffMod, 20.0f, 20000.0f);
+      break;
+   
+  }
 
-  // pass cutoffMod into filter
+
+
+
+  const float inc1 = 2.0f * M_PI * (frequencyMod + detune) / SAMPLE_RATE;
+
+  float osc2Freq = frequencyMod * powf(2.0f, osc2SemiOffset / 12.0f);
+  const float inc2 = 2.0f * M_PI * osc2Freq / SAMPLE_RATE;
+  
+  // Generate both oscillators
+  int16_t s1 = generateSample(waveform1, phase1);
+  int16_t s2 = generateSample(waveform2, phase2);
+
+  // Mix oscillators
+  int32_t mixed_osc = (int32_t)(s1 * (1.0f - osc2Level))
+                    + (int32_t)(s2 * osc2Level);
+
+
+  // Apply envelope + volume 
+  int32_t s = (int32_t)(mixed_osc * envLevel * volume);
+  s = constrain(s, -32768, 32767);
+
+  // Volume LFO (applied after envelope) 
+  if ((int)lfoTarget == 1) {
+    s = (int32_t)(s * (1.0f + lfoValue * 0.5f));
+    s = constrain(s, -32768, 32767);
+  }
+
+  int16_t sample = (int16_t)s;
+
+  // Filter 
   sample = applyFilter(sample, cutoffMod);
 
-
-
-  // Compute delay read position
+  // Delay 
   int delaySamples = (int)(delayTime * (DELAY_MAX_SAMPLES - 1));
   int delayReadPos = delayWritePos - delaySamples;
   if (delayReadPos < 0) delayReadPos += DELAY_MAX_SAMPLES;
 
-  // Read from buffer, write dry signal in
   int16_t delaySig = delayBuffer[delayReadPos];
-  delayBuffer[delayWritePos] = sample + (int16_t)(delaySig * 0.5f); // 0.5f = feedback amount
+  delayBuffer[delayWritePos] = sample + (int16_t)(delaySig * 0.5f);
   delayWritePos = (delayWritePos + 1) % DELAY_MAX_SAMPLES;
 
-  
-  int32_t mixed = (int32_t)(sample * (1.0f - delayMix)) + (int32_t)(delaySig * delayMix);
-  mixed = constrain(mixed, -32768, 32767);
+  int32_t out = (int32_t)(sample * (1.0f - delayMix))
+              + (int32_t)(delaySig * delayMix);
+  out = constrain(out, -32768, 32767);
 
-  i2s.write16((int16_t)mixed, (int16_t)mixed);
+  i2s.write16((int16_t)out, (int16_t)out);
 
-  phase += inc;
-  if (phase >= 2.0f * M_PI) phase -= 2.0f * M_PI;
+  // Advance phases
+  phase1 += inc1;
+  if (phase1 >= 2.0f * M_PI) phase1 -= 2.0f * M_PI;
+
+  phase2 += inc2;
+  if (phase2 >= 2.0f * M_PI) phase2 -= 2.0f * M_PI;
 }
-
-
-
