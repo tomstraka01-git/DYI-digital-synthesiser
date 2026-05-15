@@ -5,6 +5,12 @@
 #include <MIDI.h>
 #include "pico/multicore.h"
 
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Wire.h>
+
+#include "hardware/sync.h"
+
 #define LRCK_PIN  28   
 #define BCK_PIN   27   
 #define DIN_PIN   26   
@@ -22,8 +28,22 @@
 #define BUTTON3 22 // Mode cycle
 #define BUTTON4 13 // OSC2 waveform cycle  ← now used
 
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+
 Adafruit_USBD_MIDI usb_midi;
 MIDI_CREATE_INSTANCE(Adafruit_USBD_MIDI, usb_midi, MIDI);
+
+
+#define WAVE_SAMPLES 128
+volatile int16_t waveBuffer[WAVE_SAMPLES];
+volatile int waveIndex = 0;
+
 
 // Main mode variables
 float volume = 1.0f;
@@ -59,7 +79,7 @@ enum Mode { MAIN, ADSR, FX, LFO };
 Mode currentMode = MAIN;
 
 int waveform1 = 0;
-int waveform2 = 1; // default OSC2 to square for a different texture
+int waveform2 = 1;
 
 I2S i2s(OUTPUT);
 MCP3208 mcp(&SPI); 
@@ -148,7 +168,7 @@ void updateKnobs() {
 
       lfoRate = analogReadLog(0, 0.1f, 20.0f);
       lfoDepth = mcp.read(1) / 4095.0f;
-      lfoTarget = (float)(mcp.read(2) * 2 / 4095);
+      lfoTarget = (float)(mcp.read(2) * 3 / 4096);
       lfoAttack = analogReadLog(3, 0.05f, 5.0f);   
       osc2Level = mcp.read(4) / 4095.0f;          
       break;
@@ -214,11 +234,154 @@ inline int16_t generateSample(int wf, float ph) {
   }
 }
 
+const char* waveName(int wf) {
+  switch(wf) {
+    case 0: return "SIN";
+    case 1: return "SQR";
+    case 2: return "SAW";
+    case 3: return "TRI";
+    default: return "???";
+  }
+}
+
+const char* modeName(Mode m) {
+  switch(m) {
+    case MAIN: return "MAIN";
+    case ADSR: return "ADSR";
+    case FX:   return "FX  ";
+    case LFO:  return "LFO ";
+    default:   return "????";
+  }
+}
+
+void updateOled(int16_t sample) {
+  display.clearDisplay();
+
+  // Waveform part (top 18px) 
+  int16_t localBuf[WAVE_SAMPLES];
+  uint32_t savedIdx;
+
+  
+  uint32_t irq = save_and_disable_interrupts();
+  memcpy((void*)localBuf, (void*)waveBuffer, sizeof(localBuf));
+  savedIdx = waveIndex;
+  restore_interrupts(irq);
+
+  for (int x = 0; x < 128; x++) {
+    int idx = (savedIdx + x) % WAVE_SAMPLES;
+    int y = map((int)localBuf[idx], -32768, 32767, 17, 0);
+    display.drawPixel(x, y, SSD1306_WHITE);
+  }
+
+  // Divider line 
+  display.drawFastHLine(0, 19, 128, SSD1306_WHITE);
+
+  // Mode indicator (top right) 
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(98, 21);
+  display.print(modeName(currentMode));
+
+  
+  switch (currentMode) {
+
+    case MAIN:
+      display.setCursor(0, 21);
+      display.print("O1:"); display.print(waveName(waveform1));
+      display.print(" O2:"); display.print(waveName(waveform2));
+
+      display.setCursor(0, 31);
+      display.print("Fr:"); display.print((int)currentFrequency); display.print("Hz");
+
+      display.setCursor(0, 41);
+      display.print("Vl:"); display.print((int)(volume * 100)); display.print("%");
+      display.print(" Dt:"); display.print((int)(detune * 10) / 10.0f);
+
+      display.setCursor(0, 51);
+      display.print("PT:"); display.print((int)(portamento * 100)); display.print("%");
+      display.print(" O2:"); display.print((int)(osc2SemiOffset)); display.print("st");
+      break;
+
+    case ADSR: {
+      // Draw ADSR shape (right side, 50px wide)
+      // A
+      display.drawLine(78, 62, 88, 22, SSD1306_WHITE);
+      // D
+      int dY = 22 + (int)((1.0f - sustainLevel) * 25);
+      display.drawLine(88, 22, 98, dY, SSD1306_WHITE);
+      // S
+      display.drawLine(98, dY, 108, dY, SSD1306_WHITE);
+      // R
+      display.drawLine(108, dY, 118, 62, SSD1306_WHITE);
+
+      // Text values (left side)
+      display.setCursor(0, 21);
+      display.print("A:"); 
+      display.print(1.0f / (attackRate * SAMPLE_RATE), 2);
+      display.print("s");
+
+      display.setCursor(0, 31);
+      display.print("D:");
+      display.print(1.0f / (decayRate  * SAMPLE_RATE), 2);
+      display.print("s");
+
+      display.setCursor(0, 41);
+      display.print("S:");
+      display.print((int)(sustainLevel * 100));
+      display.print("%");
+
+      display.setCursor(0, 51);
+      display.print("R:");
+      display.print(1.0f / (releaseRate * SAMPLE_RATE), 2);
+      display.print("s");
+      break;
+    }
+
+    case FX:
+      display.setCursor(0, 21);
+      display.print("Cut:"); display.print((int)cutoff); display.print("Hz");
+
+      display.setCursor(0, 31);
+      display.print("Res:"); display.print((int)(resonance * 100)); display.print("%");
+
+      display.setCursor(0, 41);
+      display.print("Dly:"); display.print((int)(delayTime * 1000)); display.print("ms");
+
+      display.setCursor(0, 51);
+      display.print("Mix:"); display.print((int)(delayMix * 100)); display.print("%");
+      break;
+
+    case LFO: {
+      const char* targets[] = { "PITCH", "VOL  ", "FILT " };
+      display.setCursor(0, 21);
+      display.print("Rt:"); display.print(lfoRate, 1); display.print("Hz");
+
+      display.setCursor(0, 31);
+      display.print("Dp:"); display.print((int)(lfoDepth * 100)); display.print("%");
+
+      display.setCursor(0, 41);
+      display.print("Tg:"); display.print(targets[(int)lfoTarget]);
+
+      display.setCursor(0, 51);
+      display.print("Atk:"); display.print(lfoAttack, 1); display.print("s");
+      break;
+    }
+  }
+
+  // MIDI note + env state (bottom right) 
+  const char* envNames[] = { "ATK","DEC","SUS","REL","OFF" };
+  display.setCursor(98, 51);
+  display.print(envNames[envState]);
+
+  display.display();
+}
+
 void controlLoop() {
   while (true) {
     updateButtons();
     updateKnobs();
-    delay(10);
+    updateOled(0);
+    delay(50);
   }
 }
 
@@ -244,6 +407,14 @@ void setup() {
 
   usb_midi.begin();
   MIDI.begin(MIDI_CHANNEL_OMNI);
+
+  
+  Wire.setSDA(4);  // GP4
+  Wire.setSCL(5);  // GP5
+  Wire.begin();
+
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C); 
+  display.clearDisplay();
 
   multicore_launch_core1(controlLoop);
 }
@@ -338,6 +509,9 @@ void loop() {
   int32_t out = (int32_t)(sample * (1.0f - delayMix))
               + (int32_t)(delaySig * delayMix);
   out = constrain(out, -32768, 32767);
+
+  waveBuffer[waveIndex % WAVE_SAMPLES] = sample;
+  waveIndex++;
 
   i2s.write16((int16_t)out, (int16_t)out);
 
