@@ -33,17 +33,47 @@
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 
+
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 
 Adafruit_USBD_MIDI usb_midi;
 MIDI_CREATE_INSTANCE(Adafruit_USBD_MIDI, usb_midi, MIDI);
 
+// Chorus variables
+#define CHORUS_SAMPLES 2000
+int16_t chorusBuffer[CHORUS_SAMPLES];
+
+float chorus_rate = 0.0f;
+float chorus_depth = 0.0f;
+int chorusWritePos = 0;
+float chorusMix = 0.0f;
+
+
+enum ADSRState { ATTACK, DECAY, SUSTAIN, RELEASE, OFF };
+ADSRState envState = OFF;
 
 #define WAVE_SAMPLES 128
 volatile int16_t waveBuffer[WAVE_SAMPLES];
 volatile int waveIndex = 0;
 
+// Polyphony
+#define MAX_VOICES 4
+
+struct Voice {
+  float phase1, phase2;
+  float currentFreq, targetFreq;
+  float envLevel;
+  ADSRState envState;
+  int midiNote;
+  bool active;
+};
+
+Voice voices[MAX_VOICES];
+
+
+struct SVF { float low, band; };
+SVF svf[MAX_VOICES] = {};
 
 // Main mode variables
 float volume = 1.0f;
@@ -75,7 +105,7 @@ float lfoDepth = 0.0f;
 float lfoTarget = 0;
 float lfoAttack = 0.5f;
 
-enum Mode { MAIN, ADSR, FX, LFO };
+enum Mode { MAIN, ADSR, FX, FX2, LFO };
 Mode currentMode = MAIN;
 
 int waveform1 = 0;
@@ -84,8 +114,7 @@ int waveform2 = 1;
 I2S i2s(OUTPUT);
 MCP3208 mcp(&SPI); 
 
-enum ADSRState { ATTACK, DECAY, SUSTAIN, RELEASE, OFF };
-ADSRState envState = OFF;
+
 
 float attackRate = 0.015f;
 float decayRate = 0.003f;
@@ -93,8 +122,43 @@ float sustainLevel = 0.6f;
 float releaseRate = 0.003f;
 float envLevel = 0.0f;
 
-void noteOn()  { envState = ATTACK; lfoEnvelope = 0.0f; }
-void noteOff() { envState = RELEASE; }
+int allocateVoice(int note) {
+  // First: reuse same note if already playing
+  for (int i = 0; i < MAX_VOICES; i++)
+    if (voices[i].midiNote == note && voices[i].envState != OFF)
+      return i;
+
+  // Second: find a silent voice
+  for (int i = 0; i < MAX_VOICES; i++)
+    if (voices[i].envState == OFF) return i;
+
+  // Third: steal the voice with lowest envelope level
+  int steal = 0;
+  for (int i = 1; i < MAX_VOICES; i++)
+    if (voices[i].envLevel < voices[steal].envLevel) steal = i;
+  return steal;
+}
+
+void voiceNoteOn(int note) {
+  float freq = baseFrequency * powf(2.0f, (note - 69.0f) / 12.0f);
+  int v = allocateVoice(note);
+  voices[v].midiNote   = note;
+  voices[v].targetFreq = freq;
+  if (voices[v].envState == OFF)
+    voices[v].currentFreq = freq;  // snap freq if voice was silent
+  voices[v].envState = ATTACK;
+  voices[v].envLevel = 0.0f;
+  voices[v].active   = true;
+  lfoEnvelope = 0.0f;
+}
+
+void voiceNoteOff(int note) {
+  for (int i = 0; i < MAX_VOICES; i++)
+    if (voices[i].midiNote == note &&
+        voices[i].envState != OFF &&
+        voices[i].envState != RELEASE)
+      voices[i].envState = RELEASE;
+}
 
 float analogReadLog(uint8_t ch, float minT, float maxT) {
   float pot = mcp.read(ch) / 4095.0f;
@@ -117,12 +181,12 @@ void updateButtons() {
   }
 
   // note on/off
-  if (last2 == HIGH && b2 == LOW)  noteOn();
-  if (last2 == LOW  && b2 == HIGH) noteOff();
+  if (last2 == HIGH && b2 == LOW)  voiceNoteOn(69);
+  if (last2 == LOW  && b2 == HIGH) voiceNoteOff(69);
 
   // mode cycle
   if (last3 == HIGH && b3 == LOW && millis() - lastTime3 > 50) {
-    currentMode = (Mode)((currentMode + 1) % 4);
+    currentMode = (Mode)((currentMode + 1) % 5);
     lastTime3 = millis();
   }
 
@@ -158,10 +222,16 @@ void updateKnobs() {
       break;
 
     case FX:
-      cutoff = analogReadLog(0, 200.0f, 8000.0f);
+      cutoff    = analogReadLog(0, 200.0f, 8000.0f);
       resonance = mcp.read(1) / 4095.0f;
       delayTime = mcp.read(2) / 4095.0f;
-      delayMix = mcp.read(3) / 4095.0f;
+      delayMix  = mcp.read(3) / 4095.0f;
+      break;
+
+    case FX2:
+      chorus_rate  = mcp.read(0) / 4095.0f * 3.0f;
+      chorus_depth = mcp.read(1) / 4095.0f * 20.0f;
+      chorusMix    = mcp.read(2) / 4095.0f;
       break;
 
     case LFO:
@@ -177,33 +247,28 @@ void updateKnobs() {
 
 void readMidi() {
   if (MIDI.read()) {
-    if (MIDI.getType() == midi::NoteOn && MIDI.getData2() > 0) {
-      midiNote        = MIDI.getData1();  
-      targetFrequency = baseFrequency * powf(2.0f, (midiNote - 69.0f) / 12.0f);
-      noteOn();
-    }
-    if (MIDI.getType() == midi::NoteOff || 
-       (MIDI.getType() == midi::NoteOn && MIDI.getData2() == 0)) {
-      noteOff();
+    byte type = MIDI.getType();
+    byte note = MIDI.getData1();
+    byte vel  = MIDI.getData2();
+
+    if (type == midi::NoteOn && vel > 0) {
+      voiceNoteOn(note);
+    } else if (type == midi::NoteOff ||
+              (type == midi::NoteOn && vel == 0)) {
+      voiceNoteOff(note);
     }
   }
 }
 
-int16_t applyFilter(int16_t input, float fc) {
-  static float svf_low = 0.0f;
-  static float svf_band = 0.0f;
-
+int16_t applyFilter(int v, int16_t input, float fc) {
   float f = 2.0f * sinf(M_PI * fc / SAMPLE_RATE);
   if (f > 0.95f) f = 0.95f;
-
   float q  = 2.0f - (resonance * 1.9f);
   float in = (float)input;
-
-  svf_low  = svf_low + f * svf_band;
-  float svf_high = in - svf_low - q * svf_band;
-  svf_band = f * svf_high + svf_band;
-
-  return (int16_t)constrain((int32_t)svf_low, -32768, 32767);
+  svf[v].low  += f * svf[v].band;
+  float high   = in - svf[v].low - q * svf[v].band;
+  svf[v].band  = f * high + svf[v].band;
+  return (int16_t)constrain((int32_t)svf[v].low, -32768, 32767);
 }
 
 float applyLFO() {
@@ -248,7 +313,8 @@ const char* modeName(Mode m) {
   switch(m) {
     case MAIN: return "MAIN";
     case ADSR: return "ADSR";
-    case FX:   return "FX  ";
+    case FX:   return "FX1 ";
+    case FX2:  return "FX2 ";
     case LFO:  return "LFO ";
     default:   return "????";
   }
@@ -291,7 +357,7 @@ void updateOled(int16_t sample) {
       display.print(" O2:"); display.print(waveName(waveform2));
 
       display.setCursor(0, 31);
-      display.print("Fr:"); display.print((int)currentFrequency); display.print("Hz");
+      display.print("Fr:"); display.print((int)baseFrequency); display.print("Hz");
 
       display.setCursor(0, 41);
       display.print("Vl:"); display.print((int)(volume * 100)); display.print("%");
@@ -346,11 +412,24 @@ void updateOled(int16_t sample) {
 
       display.setCursor(0, 41);
       display.print("Dly:"); display.print((int)(delayTime * 1000)); display.print("ms");
+      display.print(" Mx:"); display.print((int)(delayMix * 100)); display.print("%");
 
       display.setCursor(0, 51);
-      display.print("Mix:"); display.print((int)(delayMix * 100)); display.print("%");
+      display.print("Chr:"); display.print(chorus_rate, 1); display.print("Hz");
+      display.print(" Mx:"); display.print((int)(chorusMix * 100)); display.print("%");
       break;
+    
+    case FX2:
+      display.setCursor(0, 21);
+      display.print("CRt:"); display.print(chorus_rate, 1); display.print("Hz");
 
+      display.setCursor(0, 31);
+      display.print("CDp:"); display.print((int)chorus_depth); display.print("ms");
+
+      display.setCursor(0, 41);
+      display.print("CMx:"); display.print((int)(chorusMix * 100)); display.print("%");
+      break;
+      
     case LFO: {
       const char* targets[] = { "PITCH", "VOL  ", "FILT " };
       display.setCursor(0, 21);
@@ -369,9 +448,14 @@ void updateOled(int16_t sample) {
   }
 
   // MIDI note + env state (bottom right) 
+
+  ADSRState displayState = OFF;
+  for (int i = 0; i < MAX_VOICES; i++)
+    if (voices[i].envState != OFF) { displayState = voices[i].envState; break; }
+
   const char* envNames[] = { "ATK","DEC","SUS","REL","OFF" };
   display.setCursor(98, 51);
-  display.print(envNames[envState]);
+  display.print(envNames[displayState]);
 
   display.display();
 }
@@ -420,105 +504,131 @@ void setup() {
 }
 
 
-
 void loop() {
-  static float phase1 = 0.0f;
-  static float phase2 = 0.0f;
-
-  // Portamento
-  float portaCoeff = 1.0f - portamento * 0.9997f;
-  currentFrequency += (targetFrequency - currentFrequency) * portaCoeff;
-
   readMidi();
 
-
-
-  // ADSR envelope
-  switch (envState) {
-    case ATTACK:
-      envLevel += attackRate;
-      if (envLevel >= 1.0f) { envLevel = 1.0f; envState = DECAY; }
-      break;
-    case DECAY:
-      envLevel -= decayRate;
-      if (envLevel <= sustainLevel) { envLevel = sustainLevel; envState = SUSTAIN; }
-      break;
-    case SUSTAIN: envLevel = sustainLevel; break;
-    case RELEASE:
-      envLevel -= releaseRate;
-      if (envLevel <= 0.0f) { envLevel = 0.0f; envState = OFF; }
-      break;
-    case OFF: envLevel = 0.0f; break;
+  float lfoValue  = applyLFO();
+  float cutoffMod = cutoff;
+  if ((int)lfoTarget == 2) {
+    cutoffMod *= (1.0f + lfoValue);
+    cutoffMod  = constrain(cutoffMod, 20.0f, 20000.0f);
   }
 
-  // --- LFO ---
-  float lfoValue    = applyLFO();
-  float frequencyMod = currentFrequency;
-  float cutoffMod   = cutoff;
+  float portaCoeff = 1.0f - portamento * 0.9997f;
+  int32_t mixedOut = 0;
 
-  switch ((int)lfoTarget) {
-    case 0: frequencyMod += currentFrequency * lfoValue * 0.05f; break;
-    case 2:
-      cutoffMod *= (1.0f + lfoValue);
-      cutoffMod  = constrain(cutoffMod, 20.0f, 20000.0f);
-      break;
-   
-  }
+  for (int v = 0; v < MAX_VOICES; v++) {
+    Voice& vx = voices[v];
+    if (vx.envState == OFF) continue;
 
+    // Portamento
+    vx.currentFreq += (vx.targetFreq - vx.currentFreq) * portaCoeff;
 
+    // ADSR
+    switch (vx.envState) {
+      case ATTACK:
+        vx.envLevel += attackRate;
+        if (vx.envLevel >= 1.0f) { vx.envLevel = 1.0f; vx.envState = DECAY; }
+        break;
+      case DECAY:
+        vx.envLevel -= decayRate;
+        if (vx.envLevel <= sustainLevel) { vx.envLevel = sustainLevel; vx.envState = SUSTAIN; }
+        break;
+      case SUSTAIN:
+        vx.envLevel = sustainLevel;
+        break;
+      case RELEASE:
+        vx.envLevel -= releaseRate;
+        if (vx.envLevel <= 0.0f) {
+          vx.envLevel = 0.0f;
+          vx.envState = OFF;
+          vx.active   = false;
+          continue;
+        }
+        break;
+      default: break;
+    }
 
+    // Frequency + LFO pitch mod
+    float freqMod = vx.currentFreq;
+    if ((int)lfoTarget == 0)
+      freqMod += vx.currentFreq * lfoValue * 0.05f;
 
-  const float inc1 = 2.0f * M_PI * (frequencyMod + detune) / SAMPLE_RATE;
+    float inc1 = 2.0f * M_PI * (freqMod + detune) / SAMPLE_RATE;
+    float osc2Freq = freqMod * powf(2.0f, osc2SemiOffset / 12.0f);
+    float inc2 = 2.0f * M_PI * osc2Freq / SAMPLE_RATE;
 
-  float osc2Freq = frequencyMod * powf(2.0f, osc2SemiOffset / 12.0f);
-  const float inc2 = 2.0f * M_PI * osc2Freq / SAMPLE_RATE;
-  
-  // Generate both oscillators
-  int16_t s1 = generateSample(waveform1, phase1);
-  int16_t s2 = generateSample(waveform2, phase2);
+    // Oscillators
+    int16_t s1 = generateSample(waveform1, vx.phase1);
+    int16_t s2 = generateSample(waveform2, vx.phase2);
+    int32_t osc = (int32_t)(s1 * (1.0f - osc2Level))
+                + (int32_t)(s2 * osc2Level);
 
-  // Mix oscillators
-  int32_t mixed_osc = (int32_t)(s1 * (1.0f - osc2Level))
-                    + (int32_t)(s2 * osc2Level);
+    // Envelope + volume
+    int32_t s = (int32_t)(osc * vx.envLevel * volume);
 
+    // Volume LFO
+    if ((int)lfoTarget == 1)
+      s = (int32_t)(s * (1.0f + lfoValue * 0.5f));
 
-  // Apply envelope + volume 
-  int32_t s = (int32_t)(mixed_osc * envLevel * volume);
-  s = constrain(s, -32768, 32767);
-
-  // Volume LFO (applied after envelope) 
-  if ((int)lfoTarget == 1) {
-    s = (int32_t)(s * (1.0f + lfoValue * 0.5f));
     s = constrain(s, -32768, 32767);
+
+    // Per-voice filter
+    int16_t filtered = applyFilter(v, (int16_t)s, cutoffMod);
+
+    // Mix (divide by MAX_VOICES to prevent clipping)
+    mixedOut += filtered / MAX_VOICES;
+
+    // Advance phases
+    vx.phase1 += inc1;
+    if (vx.phase1 >= 2.0f * M_PI) vx.phase1 -= 2.0f * M_PI;
+    vx.phase2 += inc2;
+    if (vx.phase2 >= 2.0f * M_PI) vx.phase2 -= 2.0f * M_PI;
   }
 
-  int16_t sample = (int16_t)s;
+  // Delay
+  mixedOut = constrain(mixedOut, -32768, 32767);
+  int16_t preDly = (int16_t)mixedOut;
 
-  // Filter 
-  sample = applyFilter(sample, cutoffMod);
-
-  // Delay 
   int delaySamples = (int)(delayTime * (DELAY_MAX_SAMPLES - 1));
   int delayReadPos = delayWritePos - delaySamples;
   if (delayReadPos < 0) delayReadPos += DELAY_MAX_SAMPLES;
 
   int16_t delaySig = delayBuffer[delayReadPos];
-  delayBuffer[delayWritePos] = sample + (int16_t)(delaySig * 0.5f);
+  delayBuffer[delayWritePos] = preDly + (int16_t)(delaySig * 0.5f);
   delayWritePos = (delayWritePos + 1) % DELAY_MAX_SAMPLES;
 
-  int32_t out = (int32_t)(sample * (1.0f - delayMix))
+  int32_t out = (int32_t)(preDly * (1.0f - delayMix))
               + (int32_t)(delaySig * delayMix);
   out = constrain(out, -32768, 32767);
 
-  waveBuffer[waveIndex % WAVE_SAMPLES] = sample;
+
+// Chorus
+  static float chorusLfoPhase = 0.0f;
+  chorusBuffer[chorusWritePos] = (int16_t)out;
+
+  float chorusLfo = sinf(chorusLfoPhase);
+  chorusLfoPhase += 2.0f * M_PI * chorus_rate / SAMPLE_RATE;
+  if (chorusLfoPhase >= 2.0f * M_PI) chorusLfoPhase -= 2.0f * M_PI;
+
+  // Base delay ~10ms plus LFO modulation
+  float delayMs = 10.0f + chorusLfo * chorus_depth;
+  int chorusDelaySamples = (int)(delayMs * SAMPLE_RATE / 1000.0f);
+  chorusDelaySamples = constrain(chorusDelaySamples, 1, CHORUS_SAMPLES - 1);
+
+  int chorusReadPos = chorusWritePos - chorusDelaySamples;
+  if (chorusReadPos < 0) chorusReadPos += CHORUS_SAMPLES;
+
+  int16_t chorusSig = chorusBuffer[chorusReadPos];
+  chorusWritePos = (chorusWritePos + 1) % CHORUS_SAMPLES;
+
+  out = (int32_t)(out * (1.0f - chorusMix))
+      + (int32_t)(chorusSig * chorusMix);
+  out = constrain(out, -32768, 32767);
+
+  
+  waveBuffer[waveIndex % WAVE_SAMPLES] = preDly;
   waveIndex++;
 
   i2s.write16((int16_t)out, (int16_t)out);
-
-  // Advance phases
-  phase1 += inc1;
-  if (phase1 >= 2.0f * M_PI) phase1 -= 2.0f * M_PI;
-
-  phase2 += inc2;
-  if (phase2 >= 2.0f * M_PI) phase2 -= 2.0f * M_PI;
 }
