@@ -203,12 +203,15 @@ void updateKnobs() {
   switch (currentMode) {
     case MAIN:
       volume = mcp.read(0) / 4095.0f;
-      {
-      float detuneAmount = (mcp.read(1) / 2047.5f) - 1.0f;
-      baseFrequency = analogReadLog(2, 20.0f, 2000.0f);
-      targetFrequency = baseFrequency * powf(2.0f, (midiNote - 69.0f) / 12.0f);
-      detune = targetFrequency * (powf(2.0f, detuneAmount * 50.0f / 1200.0f) - 1.0f);
-      }
+    {
+    float detuneAmount = (mcp.read(1) / 2047.5f) - 1.0f;
+    
+  
+    float a4Freq = 300.0f + (mcp.read(2) / 4095.0f) * 180.0f;
+    baseFrequency = a4Freq;  // baseFrequency now means "what is A4"
+
+    detune = a4Freq * (powf(2.0f, detuneAmount * 50.0f / 1200.0f) - 1.0f);
+  }
     portamento = mcp.read(3) / 4095.0f; 
     if (mcp.read(3) < 10) portamento = 0.0f;
     osc2SemiOffset = (mcp.read(4) / 4095.0f) * 48.0f - 24.0f;  // -24 to +24 semitones
@@ -352,12 +355,13 @@ void updateOled(int16_t sample) {
   switch (currentMode) {
 
     case MAIN:
+
       display.setCursor(0, 21);
       display.print("O1:"); display.print(waveName(waveform1));
       display.print(" O2:"); display.print(waveName(waveform2));
 
       display.setCursor(0, 31);
-      display.print("Fr:"); display.print((int)baseFrequency); display.print("Hz");
+      display.print("A4:"); display.print((int)baseFrequency); display.print("Hz"); // changed Fr: to A4:
 
       display.setCursor(0, 41);
       display.print("Vl:"); display.print((int)(volume * 100)); display.print("%");

@@ -5384,13 +5384,13 @@
 				(justify left)
 			)
 		)
-		(property "Value" "Conn_01x01_Pin"
-			(at 77.47 161.036 90)
+		(property "Value" "Conn pin for power amplifier"
+			(at 69.342 161.036 90)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
 				(font
-					(size 1.27 1.27)
+					(size 0.762 0.762)
 				)
 				(justify left)
 			)
@@ -5870,7 +5870,7 @@
 				)
 			)
 		)
-		(property "Value" "SS34 (SMA)3A"
+		(property "Value" "1N5822"
 			(at 60.706 164.338 0)
 			(show_name no)
 			(do_not_autoplace no)
@@ -5880,7 +5880,7 @@
 				)
 			)
 		)
-		(property "Footprint" "Fuse:Fuseholder_Cylinder-5x20mm_Bulgin_FX0457_Horizontal_Closed"
+		(property "Footprint" "Diode_THT:D_DO-201AD_P15.24mm_Horizontal"
 			(at 66.04 168.91 0)
 			(hide yes)
 			(show_name no)
@@ -8145,7 +8145,7 @@
 				)
 			)
 		)
-		(property "Value" "Littelfuse 0451002.MRL 2A"
+		(property "Value" "Littelfuse 02301002H"
 			(at 44.196 167.132 90)
 			(show_name no)
 			(do_not_autoplace no)
@@ -8155,7 +8155,7 @@
 				)
 			)
 		)
-		(property "Footprint" ""
+		(property "Footprint" "Fuse:Fuseholder_Cylinder-5x20mm_Schurter_0031_8201_Horizontal_Open"
 			(at 55.88 170.688 90)
 			(hide yes)
 			(show_name no)
