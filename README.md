@@ -20,6 +20,10 @@ The project uses custom pcb and some modules. It uses PCM5102 I2S audio module f
 ![Image](screenshots/Image7.png)
 ![Image](screenshots/Image8.png)
 
+## Case
+I wont use a case for the synthesizer, it will all be on the pcb and few things wich are not on it, like battery are gonna be held there with zip ties and other things.
+![Image](screenshots/Image6.png)
+
 | Name | Purpose | Quantity | Total Cost (USD) | Link | Distributor |
 |:---|:---|-----------:|-------------------:|:---|:---|
 | Custom JLCPCB PCB | A custom pcb connecting parts together. | 1 | 6.9 | https://cart.jlcpcb.com/quote?stencilLayer=2&stencilWidth=100&stencilLength=100&stencilCounts=5&plateType=1&spm=Jlcpcb.Homepage.1010 | JLCPCB |
